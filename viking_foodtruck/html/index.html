@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="style.css">
+  <title>Food Truck Creator</title>
+</head>
+<body>
+  <div id="app" class="shell hidden">
+    <aside class="sidebar">
+      <header class="brand">
+        <div class="badge">FT</div>
+        <div>
+          <h1>Food Truck Creator</h1>
+          <p>Standalone business registry</p>
+        </div>
+      </header>
+
+      <div class="toolbar">
+        <button id="btnNew" class="btn primary" type="button">+ New Truck</button>
+        <button id="btnRefresh" class="btn" type="button">Refresh</button>
+      </div>
+
+      <div class="section-label">Registered Trucks</div>
+      <ul id="truckList" class="list"></ul>
+
+      <div class="section-label">Starter Templates</div>
+      <ul id="templateList" class="list templates"></ul>
+
+      <div class="bridge-meta" id="bridgeMeta"></div>
+    </aside>
+
+    <main class="editor">
+      <header class="editor-head">
+        <div>
+          <h2 id="editorTitle">Select or Create a Truck</h2>
+          <p>Define vehicle, menu, stock, and shop behavior.</p>
+        </div>
+        <button id="btnClose" class="btn ghost" type="button">Close</button>
+      </header>
+
+      <div id="editorEmpty" class="empty">
+        Choose a truck from the left, import a template, or click <strong>New Truck</strong>.
+      </div>
+
+      <form id="truckForm" class="form hidden">
+        <div class="tabs">
+          <button type="button" class="tab active" data-tab="basic">Basic</button>
+          <button type="button" class="tab" data-tab="vehicle">Vehicle</button>
+          <button type="button" class="tab" data-tab="menu">Menu</button>
+          <button type="button" class="tab" data-tab="shop">Shop</button>
+          <button type="button" class="tab" data-tab="stock">Stock</button>
+        </div>
+
+        <div class="tab-panel active" data-panel="basic">
+          <label>Truck ID <span class="hint">(slug, no spaces)</span>
+            <input id="fId" type="text" pattern="[a-z0-9_]+" placeholder="taco_truck" required>
+          </label>
+          <label>Display Label
+            <input id="fLabel" type="text" placeholder="El Camino Tacos" required>
+          </label>
+          <div class="row">
+            <label>Category
+              <select id="fCategory"></select>
+            </label>
+            <label>Enabled
+              <select id="fEnabled">
+                <option value="true">Yes</option>
+                <option value="false">No</option>
+              </select>
+            </label>
+          </div>
+          <label>Purchase Price
+            <input id="fPrice" type="number" min="0" step="1" value="50000">
+          </label>
+          <label>Description
+            <textarea id="fDescription" rows="3" placeholder="Shown at the broker ped"></textarea>
+          </label>
+        </div>
+
+        <div class="tab-panel" data-panel="vehicle">
+          <label>Vehicle Model
+            <input id="fVehicle" type="text" list="vehicleList" placeholder="taco">
+            <datalist id="vehicleList"></datalist>
+          </label>
+          <div class="row">
+            <label>Plate Prefix
+              <input id="fPlate" type="text" maxlength="6" placeholder="FOOD">
+            </label>
+            <label>Livery (optional)
+              <input id="fLivery" type="number" min="0" step="1" placeholder="0">
+            </label>
+          </div>
+          <div class="section-label inline">Default Retrieve Spot</div>
+          <div class="row coords">
+            <input id="fRetX" type="number" step="0.01" placeholder="X">
+            <input id="fRetY" type="number" step="0.01" placeholder="Y">
+            <input id="fRetZ" type="number" step="0.01" placeholder="Z">
+            <input id="fRetW" type="number" step="0.01" placeholder="H">
+          </div>
+          <button id="btnUseCoords" class="btn" type="button">Use My Coords</button>
+        </div>
+
+        <div class="tab-panel" data-panel="menu">
+          <div class="panel-toolbar">
+            <span>Menu Items</span>
+            <button id="btnAddMenu" class="btn" type="button">+ Add Item</button>
+          </div>
+          <div id="menuRows" class="dynamic-rows"></div>
+        </div>
+
+        <div class="tab-panel" data-panel="shop">
+          <div class="row">
+            <label>Shop Radius
+              <input id="fShopRadius" type="number" min="1" max="15" step="0.1" value="3">
+            </label>
+            <label>Window Offset Y
+              <input id="fWinY" type="number" step="0.1" value="-2">
+            </label>
+          </div>
+          <div class="row">
+            <label>Window Offset X
+              <input id="fWinX" type="number" step="0.1" value="0">
+            </label>
+            <label>Window Offset Z
+              <input id="fWinZ" type="number" step="0.1" value="0">
+            </label>
+          </div>
+          <div class="section-label inline">Open-Shop Blip</div>
+          <div class="row">
+            <label>Enabled
+              <select id="fBlipEnabled">
+                <option value="true">Yes</option>
+                <option value="false">No</option>
+              </select>
+            </label>
+            <label>Sprite
+              <input id="fBlipSprite" type="number" value="106">
+            </label>
+          </div>
+          <div class="row">
+            <label>Color
+              <input id="fBlipColor" type="number" value="5">
+            </label>
+            <label>Scale
+              <input id="fBlipScale" type="number" step="0.05" value="0.75">
+            </label>
+          </div>
+        </div>
+
+        <div class="tab-panel" data-panel="stock">
+          <label>Max Stock Per Item
+            <input id="fMaxStock" type="number" min="1" value="250">
+          </label>
+          <div class="panel-toolbar">
+            <span>Starting Stock</span>
+            <button id="btnAddStock" class="btn" type="button">+ Add Row</button>
+          </div>
+          <div id="stockRows" class="dynamic-rows"></div>
+        </div>
+
+        <footer class="form-actions">
+          <button id="btnDelete" class="btn danger" type="button">Delete</button>
+          <button id="btnSave" class="btn primary" type="submit">Save Truck</button>
+        </footer>
+      </form>
+    </main>
+  </div>
+
+  <!-- Built-in UI fallbacks (used when ox_lib is missing/broken) -->
+  <div id="ftTextUi" class="ft-textui hidden"></div>
+  <div id="ftProgress" class="ft-progress hidden">
+    <div class="ft-progress-label"></div>
+    <div class="ft-progress-bar"><div class="ft-progress-fill"></div></div>
+  </div>
+  <div id="ftOverlay" class="ft-overlay hidden">
+    <div class="ft-modal">
+      <h3 id="ftModalTitle"></h3>
+      <div id="ftModalBody"></div>
+      <div id="ftModalActions" class="ft-modal-actions"></div>
+    </div>
+  </div>
+
+  <!-- Inventory-style truck stock -->
+  <div id="ftStockInv" class="ft-stockinv hidden">
+    <div class="ft-stockinv-panel">
+      <header class="ft-stockinv-head">
+        <div>
+          <h3 id="ftStockTitle">Truck Stock</h3>
+          <p>Prepared food &amp; ingredients</p>
+        </div>
+        <div class="ft-stockinv-actions">
+          <button type="button" class="btn" id="ftStockDepositNew">+ Deposit</button>
+          <button type="button" class="btn" id="ftStockRefresh">Refresh</button>
+          <button type="button" class="btn ghost" id="ftStockClose">Close</button>
+        </div>
+      </header>
+      <div class="ft-stockinv-sections">
+        <section>
+          <h4>Prepared Food <span class="hint">(ready to sell)</span></h4>
+          <div id="ftStockPrepared" class="ft-stock-grid"></div>
+        </section>
+        <section>
+          <h4>Ingredients / Stock</h4>
+          <div id="ftStockIngredients" class="ft-stock-grid"></div>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>

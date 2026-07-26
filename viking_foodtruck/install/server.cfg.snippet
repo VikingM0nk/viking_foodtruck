@@ -1,0 +1,9 @@
+# viking_foodtruck
+ensure oxmysql
+# ox_lib is optional — only ensure it if you have a full release build installed
+# ensure ox_lib
+# ensure your framework / inventory before or after — bridges auto-detect
+ensure viking_foodtruck
+
+# Admin access for /foodtruckcreator
+add_ace group.admin foodtruck.admin allow
