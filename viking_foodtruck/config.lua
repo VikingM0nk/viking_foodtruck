@@ -148,11 +148,10 @@ Config.GiveKeys = {
 }
 
 --[[
-    Garage parking — writes ownership to ALL available backends:
-      player_vehicles (QB/JG/cd/okok/qs), owned_vehicles (ESX),
-      qbx_vehicles, jg-advancedgarages, cd_garage, okok, loaf, rcore.
+    Garage — ONE food truck vehicle per owner, saved to DB on purchase only.
+    Spawn/park/sync only UPDATE that row (never insert another).
+    Backends: player_vehicles / owned_vehicles / qbx_vehicles + garage hooks.
     Set GarageDefault to a garage id that exists in YOUR garage script.
-    With jg-advancedgarages, an invalid id is auto-replaced by the first public car garage.
 ]]
 Config.Garage = 'auto' -- auto | qb | qbox | esx | jg | cd | okok | qs | custom | none
 Config.GarageAllowPark = true

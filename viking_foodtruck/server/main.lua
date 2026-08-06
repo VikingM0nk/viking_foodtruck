@@ -394,21 +394,27 @@ lib.callback.register('viking_foodtruck:purchaseTruck', function(source, truckId
     DB.UpsertTruck(truck)
     Trucks.cache[truckId] = truck
 
+    -- One garage vehicle per owner, written to DB on purchase only
     if Garage and Garage.RegisterVehicle then
         local modelName = truck.data.vehicle or Config.DefaultVehicle or 'taco'
+        if Garage.RemoveOwnerFoodTrucks then
+            Garage.RemoveOwnerFoodTrucks(identifier, modelName)
+        end
         local registered = Garage.RegisterVehicle(source, identifier, modelName, truck.data.plate, {
             model = joaat(modelName),
             plate = truck.data.plate,
         }, {
-            state = 0,
+            -- Saved in garage DB immediately; spawn/sync will mark it OUT
+            state = 1,
             garage = Config.GarageDefault or 'pillboxgarage',
+            allowCreate = true,
         })
         if registered then
-            print(('[viking_foodtruck] Purchase registered garage vehicle plate=%s for %s'):format(
+            print(('[viking_foodtruck] Purchase saved garage vehicle plate=%s for %s'):format(
                 truck.data.plate, identifier
             ))
         else
-            print(('[viking_foodtruck] WARNING: garage register failed on purchase plate=%s'):format(truck.data.plate))
+            print(('[viking_foodtruck] WARNING: garage DB save failed on purchase plate=%s'):format(truck.data.plate))
         end
     end
 
@@ -460,7 +466,11 @@ lib.callback.register('viking_foodtruck:sellTruck', function(source, truckId)
         DB.SaveAccount(account)
     end
 
-    -- Remove from garage ownership so the old owner can't keep the truck
+    -- Remove garage vehicle(s) so the old owner can't keep duplicates
+    local modelName = (truck.data and truck.data.vehicle) or Config.DefaultVehicle or 'taco'
+    if Garage and Garage.RemoveOwnerFoodTrucks then
+        Garage.RemoveOwnerFoodTrucks(identifier, modelName)
+    end
     if Garage and Garage.RemoveVehicle and truck.data and truck.data.plate then
         Garage.RemoveVehicle(truck.data.plate)
     end
@@ -542,10 +552,19 @@ lib.callback.register('viking_foodtruck:parkVehicle', function(source, truckId, 
     local ownerId = truck.owner_id or Bridge.GetIdentifier(source)
     local ownerSrc = (Keys and Keys.GetSourceByIdentifier and Keys.GetSourceByIdentifier(ownerId)) or source
     if Garage and Garage.RegisterVehicle then
+        -- Update existing purchase row only; create once if purchase never wrote DB
         local ok = Garage.RegisterVehicle(ownerSrc, ownerId, modelName, plate, props, {
             state = 1,
             garage = Config.GarageDefault,
+            allowCreate = false,
         })
+        if not ok then
+            ok = Garage.RegisterVehicle(ownerSrc, ownerId, modelName, plate, props, {
+                state = 1,
+                garage = Config.GarageDefault,
+                allowCreate = true,
+            })
+        end
         Garage.SetStored(plate, Config.GarageDefault, props)
         local exists, owned, row = false, false, nil
         if Garage.VerifyOwned then
@@ -599,10 +618,12 @@ lib.callback.register('viking_foodtruck:syncGarageProps', function(source, truck
     local modelName = (truck.data and truck.data.vehicle) or Config.DefaultVehicle or 'taco'
     local ownerId = truck.owner_id or Bridge.GetIdentifier(source)
     local ownerSrc = (Keys and Keys.GetSourceByIdentifier and Keys.GetSourceByIdentifier(ownerId)) or source
+    -- Never create a new garage vehicle on spawn/sync — only update the purchase row
     if Garage and Garage.RegisterVehicle then
         local ok = Garage.RegisterVehicle(ownerSrc, ownerId, modelName, plate, props, {
             state = 0,
             netId = tonumber(netId),
+            allowCreate = false,
         })
         Garage.SetOut(plate, tonumber(netId))
         return ok and true or false

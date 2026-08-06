@@ -93,7 +93,7 @@ local function encodeMods(props)
     return '{}'
 end
 
-local function ensureProps(props, modelName, plate)
+local function ensureProps(props, modelName, plate, ownerId)
     props = type(props) == 'table' and props or {}
     local model = props.model
     if type(model) == 'string' then
@@ -104,7 +104,28 @@ local function ensureProps(props, modelName, plate)
     props.engineHealth = props.engineHealth or 1000.0
     props.bodyHealth = props.bodyHealth or 1000.0
     props.fuelLevel = props.fuelLevel or props.fuel or 100.0
+    -- Marker so we can find / dedupe this owner's single foodtruck vehicle
+    props.foodtruck = true
+    if ownerId then props.foodtruckOwner = tostring(ownerId) end
     return props
+end
+
+local function isFoodTruckRow(row, modelName)
+    if not row then return false end
+    if row.vehicle and modelName and tostring(row.vehicle):lower() == tostring(modelName):lower() then
+        return true
+    end
+    local mods = row.mods or row.vehicle
+    if type(mods) == 'string' and mods ~= '' then
+        if mods:find('"foodtruck"%s*:%s*true') or mods:find('"foodtruck":true') then
+            return true
+        end
+        local ok, decoded = pcall(json.decode, mods)
+        if ok and type(decoded) == 'table' and decoded.foodtruck then
+            return true
+        end
+    end
+    return false
 end
 
 if not IsDuplicityVersion() then
@@ -325,20 +346,89 @@ local function mysqlInsert(sql, vals)
     return true, result
 end
 
---- Dynamic insert into player_vehicles using only columns that exist
-local function upsertPlayerVehicles(ownerSrc, ownerId, modelName, plate, props, state, garageName)
+local function listOwnerPlayerVehicles(ownerId)
+    if not tableExists('player_vehicles') or not ownerId then return {} end
+    if not hasColumn('player_vehicles', 'citizenid') then return {} end
+    local ok, rows = pcall(function()
+        return MySQL.query.await('SELECT * FROM player_vehicles WHERE citizenid = ?', { ownerId })
+    end)
+    return (ok and rows) or {}
+end
+
+local function findOwnerFoodTruckVehicle(ownerId, modelName, plate)
+    plate = trimPlate(plate)
+    local byPlate = findPlayerVehicle(plate)
+    if byPlate then return byPlate end
+
+    local rows = listOwnerPlayerVehicles(ownerId)
+    local fallback
+    for i = 1, #rows do
+        local row = rows[i]
+        if isFoodTruckRow(row, modelName) then
+            return row
+        end
+        if modelName and row.vehicle and tostring(row.vehicle):lower() == tostring(modelName):lower() then
+            fallback = fallback or row
+        end
+    end
+    return fallback
+end
+
+--- Keep exactly one food-truck garage row for this owner (delete extras)
+local function dedupeOwnerFoodTrucks(ownerId, modelName, keepPlate)
+    keepPlate = trimPlate(keepPlate)
+    local rows = listOwnerPlayerVehicles(ownerId)
+    local keepId
+    for i = 1, #rows do
+        local row = rows[i]
+        if trimPlate(row.plate) == keepPlate or compactPlate(row.plate) == compactPlate(keepPlate) then
+            keepId = row.id
+            break
+        end
+    end
+    if not keepId then
+        for i = 1, #rows do
+            if isFoodTruckRow(rows[i], modelName) then
+                keepId = rows[i].id
+                break
+            end
+        end
+    end
+
+    for i = 1, #rows do
+        local row = rows[i]
+        if isFoodTruckRow(row, modelName) or (modelName and row.vehicle and tostring(row.vehicle):lower() == tostring(modelName):lower() and row.mods and tostring(row.mods):find('foodtruck')) then
+            if keepId and row.id == keepId then
+                goto continue
+            end
+            if keepId then
+                pcall(function()
+                    MySQL.query.await('DELETE FROM player_vehicles WHERE id = ?', { row.id })
+                end)
+                print(('[viking_foodtruck] Removed duplicate garage vehicle id=%s plate=%s owner=%s'):format(
+                    tostring(row.id), tostring(row.plate), tostring(ownerId)
+                ))
+            elseif not keepId then
+                keepId = row.id
+            end
+        end
+        ::continue::
+    end
+end
+
+--- Dynamic insert/update into player_vehicles (one food truck per owner)
+local function upsertPlayerVehicles(ownerSrc, ownerId, modelName, plate, props, state, garageName, allowCreate)
     if not tableExists('player_vehicles') then return false, 'no_table' end
     plate = trimPlate(plate)
-    props = ensureProps(props, modelName, plate)
+    props = ensureProps(props, modelName, plate, ownerId)
     local mods = encodeMods(props)
     local hashNum = signedHash(modelName)
-    local hashStr = tostring(props.model or joaat(modelName))
     local license = getLicense(ownerSrc)
     garageName = garageName or defaultGarage()
     state = tonumber(state) or 0
     local gCol = garageColumnFor('player_vehicles')
 
-    local existing = findPlayerVehicle(plate)
+    local existing = findOwnerFoodTruckVehicle(ownerId, modelName, plate)
     if existing then
         local sets, vals = {}, {}
         local function set(col, val)
@@ -352,10 +442,10 @@ local function upsertPlayerVehicles(ownerSrc, ownerId, modelName, plate, props, 
         set('license', license)
         set('vehicle', modelName)
         if hasColumn('player_vehicles', 'hash') then
-            -- Prefer numeric when column is int-like; string still works via coercion
             set('hash', hashNum)
         end
         set('mods', mods)
+        set('plate', plate) -- keep plate in sync with business plate
         if gCol then set(gCol, garageName) end
         set('state', state)
         set('stored', state == 1 and 1 or 0)
@@ -365,15 +455,32 @@ local function upsertPlayerVehicles(ownerSrc, ownerId, modelName, plate, props, 
         set('body', tonumber(props.bodyHealth) or 1000.0)
         set('depotprice', 0)
         if #sets == 0 then return true, 'noop' end
-        local wherePlate = existing.plate or plate
-        vals[#vals + 1] = wherePlate
-        if mysqlUpdate(
-            ('UPDATE player_vehicles SET %s WHERE plate = ?'):format(table.concat(sets, ', ')),
-            vals
-        ) then
-            return true, 'updated'
+
+        if existing.id then
+            vals[#vals + 1] = existing.id
+            if mysqlUpdate(
+                ('UPDATE player_vehicles SET %s WHERE id = ?'):format(table.concat(sets, ', ')),
+                vals
+            ) then
+                dedupeOwnerFoodTrucks(ownerId, modelName, plate)
+                return true, 'updated'
+            end
+        else
+            local wherePlate = existing.plate or plate
+            vals[#vals + 1] = wherePlate
+            if mysqlUpdate(
+                ('UPDATE player_vehicles SET %s WHERE plate = ?'):format(table.concat(sets, ', ')),
+                vals
+            ) then
+                dedupeOwnerFoodTrucks(ownerId, modelName, plate)
+                return true, 'updated'
+            end
         end
         return false, 'update_failed'
+    end
+
+    if not allowCreate then
+        return false, 'no_existing_row'
     end
 
     local cols, vals, marks = {}, {}, {}
@@ -405,7 +512,7 @@ local function upsertPlayerVehicles(ownerSrc, ownerId, modelName, plate, props, 
     add('paymentamount', 0)
     add('paymentsleft', 0)
     add('financetime', 0)
-    add('nickname', '')
+    add('nickname', 'Food Truck')
     add('damage', '')
     add('logs', '[]')
 
@@ -419,27 +526,40 @@ local function upsertPlayerVehicles(ownerSrc, ownerId, modelName, plate, props, 
         vals
     )
     if not ok then
-        -- Retry without optional finance fields if schema is picky
         return false, 'insert_failed'
     end
 
-    -- Verify row landed
     if not findPlayerVehicle(plate) then
         print(('[viking_foodtruck] player_vehicles insert reported ok but row missing for plate=%s'):format(plate))
         return false, 'verify_failed'
     end
+    dedupeOwnerFoodTrucks(ownerId, modelName, plate)
     return true, 'inserted'
 end
 
-local function upsertOwnedVehicles(ownerId, modelName, plate, props, stored, garageName)
+local function upsertOwnedVehicles(ownerId, modelName, plate, props, stored, garageName, allowCreate)
     if not tableExists('owned_vehicles') then return false, 'no_table' end
     plate = trimPlate(plate)
-    props = ensureProps(props, modelName, plate)
+    props = ensureProps(props, modelName, plate, ownerId)
     local vehicleJson = encodeMods(props)
     garageName = garageName or defaultGarage()
     stored = stored and 1 or 0
 
     local existing = findOwnedVehicle(plate)
+    if not existing and hasColumn('owned_vehicles', 'owner') then
+        local ok, rows = pcall(function()
+            return MySQL.query.await('SELECT * FROM owned_vehicles WHERE owner = ?', { ownerId })
+        end)
+        if ok and rows then
+            for i = 1, #rows do
+                if isFoodTruckRow(rows[i], modelName) then
+                    existing = rows[i]
+                    break
+                end
+            end
+        end
+    end
+
     if existing then
         local sets, vals = {}, {}
         local function set(col, val)
@@ -450,6 +570,7 @@ local function upsertOwnedVehicles(ownerId, modelName, plate, props, stored, gar
             end
         end
         set('owner', ownerId)
+        set('plate', plate)
         set('vehicle', vehicleJson)
         set('stored', stored)
         set('parking', garageName)
@@ -465,6 +586,10 @@ local function upsertOwnedVehicles(ownerId, modelName, plate, props, stored, gar
             return true, 'updated'
         end
         return false, 'update_failed'
+    end
+
+    if not allowCreate then
+        return false, 'no_existing_row'
     end
 
     local cols, vals, marks = {}, {}, {}
@@ -500,19 +625,31 @@ local function upsertOwnedVehicles(ownerId, modelName, plate, props, stored, gar
     return true, 'inserted'
 end
 
-local function registerQbx(ownerId, modelName, plate, props, garageName, asStored)
-    if not started('qbx_vehicles') then return false end
+--- returns ok, created (created = true only when a new qbx vehicle was inserted)
+local function registerQbx(ownerId, modelName, plate, props, garageName, asStored, allowCreate)
+    if not started('qbx_vehicles') then return false, false end
     plate = trimPlate(plate)
-    props = ensureProps(props, modelName, plate)
+    props = ensureProps(props, modelName, plate, ownerId)
     garageName = garageName or defaultGarage()
 
     local existingId
     local okFind, id = tryExport('qbx_vehicles', 'GetVehicleIdByPlate', plate)
     if okFind and id then existingId = id end
 
+    if not existingId then
+        local row = findOwnerFoodTruckVehicle(ownerId, modelName, plate)
+        if row and row.id then existingId = row.id end
+    end
+
     if existingId then
         pcall(function()
             exports.qbx_vehicles:SetPlayerVehicleOwner(existingId, ownerId)
+        end)
+        pcall(function()
+            MySQL.update.await(
+                'UPDATE player_vehicles SET plate = ?, state = ?, citizenid = ?, mods = ?, garage = ?, vehicle = ? WHERE id = ?',
+                { plate, asStored and 1 or 0, ownerId, encodeMods(props), garageName, modelName, existingId }
+            )
         end)
         if asStored then
             pcall(function()
@@ -522,14 +659,13 @@ local function registerQbx(ownerId, modelName, plate, props, garageName, asStore
                     props = props,
                 })
             end)
-        else
-            pcall(function()
-                MySQL.update.await('UPDATE player_vehicles SET state = 0, citizenid = ?, mods = ?, plate = ? WHERE id = ?', {
-                    ownerId, encodeMods(props), plate, existingId,
-                })
-            end)
         end
-        return true
+        dedupeOwnerFoodTrucks(ownerId, modelName, plate)
+        return true, false
+    end
+
+    if not allowCreate then
+        return false, false
     end
 
     local request = {
@@ -541,36 +677,35 @@ local function registerQbx(ownerId, modelName, plate, props, garageName, asStore
 
     local ok, vehicleId, err = tryExport('qbx_vehicles', 'CreatePlayerVehicle', request)
     if ok and vehicleId then
-        -- Force our plate + desired state (CreatePlayerVehicle may assign random plate)
         pcall(function()
             MySQL.update.await(
-                'UPDATE player_vehicles SET plate = ?, state = ?, citizenid = ?, mods = ?, garage = ? WHERE id = ?',
-                { plate, asStored and 1 or 0, ownerId, encodeMods(props), garageName, vehicleId }
+                'UPDATE player_vehicles SET plate = ?, state = ?, citizenid = ?, mods = ?, garage = ?, vehicle = ? WHERE id = ?',
+                { plate, asStored and 1 or 0, ownerId, encodeMods(props), garageName, modelName, vehicleId }
             )
         end)
-        -- Also try garage_id if present
         if hasColumn('player_vehicles', 'garage_id') then
             pcall(function()
                 MySQL.update.await('UPDATE player_vehicles SET garage_id = ? WHERE id = ?', { garageName, vehicleId })
             end)
         end
+        dedupeOwnerFoodTrucks(ownerId, modelName, plate)
         print(('[viking_foodtruck] qbx_vehicles registered plate=%s id=%s'):format(plate, tostring(vehicleId)))
-        return true
+        return true, true
     end
     if err then
         print(('[viking_foodtruck] qbx_vehicles CreatePlayerVehicle failed: %s'):format(
             type(err) == 'table' and json.encode(err) or tostring(err)
         ))
     end
-    return false
+    return false, false
 end
 
-local function fireGarageHooks(ownerSrc, ownerId, modelName, plate, props, state, garageName, netId)
+--- State/keys hooks only. Ownership "give vehicle" exports run solely on create.
+local function fireGarageHooks(ownerSrc, ownerId, modelName, plate, props, state, garageName, netId, grantOwnership)
     plate = trimPlate(plate)
     garageName = garageName or defaultGarage()
     state = tonumber(state) or 0
 
-    -- qb-garages (plural + singular resource names)
     TriggerEvent('qb-garages:server:updateVehicleState', state, plate, garageName)
     TriggerEvent('qb-garage:server:updateVehicleState', state, plate, garageName)
     if ownerSrc then
@@ -578,7 +713,6 @@ local function fireGarageHooks(ownerSrc, ownerId, modelName, plate, props, state
         TriggerClientEvent('qb-garages:client:updateVehicleState', ownerSrc, state, plate, garageName)
     end
 
-    -- cd_garage
     if started('cd_garage') then
         if ownerSrc then
             pcall(function()
@@ -586,21 +720,23 @@ local function fireGarageHooks(ownerSrc, ownerId, modelName, plate, props, state
             end)
             TriggerClientEvent('cd_garage:AddKeys', ownerSrc, plate)
         end
-        tryExport('cd_garage', 'AddOwnedVehicle', ownerSrc, plate, modelName, props)
+        if grantOwnership then
+            tryExport('cd_garage', 'AddOwnedVehicle', ownerSrc, plate, modelName, props)
+        end
         tryExport('cd_garage', 'SetVehicleState', plate, state, garageName)
         tryExport('cd_garage', 'UpdateVehicleState', plate, state, garageName)
     end
 
-    -- okokGarage
     if started('okokGarage') then
         if ownerSrc then
             TriggerClientEvent('okokGarage:GiveKeys', ownerSrc, plate)
+            tryExport('okokGarage', 'GiveKeys', ownerSrc, plate)
         end
-        tryExport('okokGarage', 'GiveVehicle', ownerSrc, modelName, plate)
-        tryExport('okokGarage', 'GiveKeys', ownerSrc, plate)
+        if grantOwnership then
+            tryExport('okokGarage', 'GiveVehicle', ownerSrc, modelName, plate)
+        end
     end
 
-    -- jg-advancedgarages
     if started('jg-advancedgarages') then
         if netId and state == 0 then
             tryExport('jg-advancedgarages', 'registerVehicleOutside', plate, netId)
@@ -611,19 +747,18 @@ local function fireGarageHooks(ownerSrc, ownerId, modelName, plate, props, state
         end
     end
 
-    -- qs-advancedgarages
     if started('qs-advancedgarages') then
-        tryExport('qs-advancedgarages', 'addVehicle', ownerSrc, modelName, plate, garageName)
+        if grantOwnership then
+            tryExport('qs-advancedgarages', 'addVehicle', ownerSrc, modelName, plate, garageName)
+        end
         tryExport('qs-advancedgarages', 'setVehicleState', plate, state, garageName)
     end
 
-    -- loaf_garage
-    if started('loaf_garage') then
+    if grantOwnership and started('loaf_garage') then
         tryExport('loaf_garage', 'AddVehicle', ownerId, plate, modelName, props)
     end
 
-    -- rcore_garage
-    if started('rcore_garage') then
+    if grantOwnership and started('rcore_garage') then
         tryExport('rcore_garage', 'addVehicle', ownerSrc, modelName, plate)
     end
 
@@ -632,7 +767,9 @@ local function fireGarageHooks(ownerSrc, ownerId, modelName, plate, props, state
     TriggerEvent('viking_foodtruck:garageRegistered', ownerSrc, ownerId, modelName, plate, props, state, garageName)
 end
 
---- Register / refresh ownership across every available garage backend
+--- Register / refresh ownership.
+--- opts.allowCreate = true  → insert a new DB row (purchase only)
+--- opts.allowCreate = false → update existing row only (spawn/park/sync)
 function Garage.RegisterVehicle(ownerSrc, ownerId, modelName, plate, props, opts)
     if Config.GarageAllowPark == false then return true end
     opts = opts or {}
@@ -642,48 +779,106 @@ function Garage.RegisterVehicle(ownerSrc, ownerId, modelName, plate, props, opts
         return false, 'Invalid plate/owner'
     end
     modelName = tostring(modelName or Config.DefaultVehicle or 'taco'):lower()
-    props = ensureProps(props, modelName, plate)
+    props = ensureProps(props, modelName, plate, ownerId)
     local garageName = resolveGarageName(opts.garage)
     local state = opts.state
     if state == nil then state = 0 end
     local asStored = state == 1
+    local allowCreate = opts.allowCreate == true
     local okAny = false
+    local created = false
+
+    if allowCreate then
+        -- One vehicle per owner: remove any previous food-truck garage copies first
+        if Garage.RemoveOwnerFoodTrucks then
+            Garage.RemoveOwnerFoodTrucks(ownerId, modelName)
+        else
+            dedupeOwnerFoodTrucks(ownerId, modelName, plate)
+        end
+    end
 
     local custom = Config.CustomGarage or {}
-    if custom.resource and custom.registerExport and started(custom.resource) then
+    if allowCreate and custom.resource and custom.registerExport and started(custom.resource) then
         local ok = tryExport(custom.resource, custom.registerExport, ownerSrc, ownerId, modelName, plate, props, garageName)
         okAny = okAny or ok
+        created = created or ok
     end
 
-    if registerQbx(ownerId, modelName, plate, props, garageName, asStored) then
+    local qbxOk, qbxCreated = registerQbx(ownerId, modelName, plate, props, garageName, asStored, allowCreate)
+    if qbxOk then
         okAny = true
+        created = created or qbxCreated
+        -- qbx already wrote player_vehicles — do not insert a second row
+        if qbxCreated then allowCreate = false end
     end
 
-    local okPv, pvMsg = upsertPlayerVehicles(ownerSrc, ownerId, modelName, plate, props, state, garageName)
+    local okPv, pvMsg = upsertPlayerVehicles(ownerSrc, ownerId, modelName, plate, props, state, garageName, allowCreate)
     if okPv then
         okAny = true
-        print(('[viking_foodtruck] player_vehicles %s plate=%s owner=%s state=%s garage=%s'):format(
-            tostring(pvMsg), plate, tostring(ownerId), tostring(state), garageName
+        if pvMsg == 'inserted' then created = true end
+        print(('[viking_foodtruck] player_vehicles %s plate=%s owner=%s state=%s garage=%s create=%s'):format(
+            tostring(pvMsg), plate, tostring(ownerId), tostring(state), garageName, tostring(allowCreate)
         ))
-    elseif pvMsg and pvMsg ~= 'no_table' then
+    elseif pvMsg and pvMsg ~= 'no_table' and pvMsg ~= 'no_existing_row' then
         print(('[viking_foodtruck] player_vehicles failed (%s) plate=%s'):format(tostring(pvMsg), plate))
     end
 
-    local okOv, ovMsg = upsertOwnedVehicles(ownerId, modelName, plate, props, asStored, garageName)
+    local okOv, ovMsg = upsertOwnedVehicles(ownerId, modelName, plate, props, asStored, garageName, allowCreate)
     if okOv then
         okAny = true
+        if ovMsg == 'inserted' then created = true end
         print(('[viking_foodtruck] owned_vehicles %s plate=%s owner=%s'):format(tostring(ovMsg), plate, tostring(ownerId)))
-    elseif ovMsg and ovMsg ~= 'no_table' then
+    elseif ovMsg and ovMsg ~= 'no_table' and ovMsg ~= 'no_existing_row' then
         print(('[viking_foodtruck] owned_vehicles failed (%s) plate=%s'):format(tostring(ovMsg), plate))
     end
 
-    fireGarageHooks(ownerSrc, ownerId, modelName, plate, props, state, garageName, opts.netId)
+    -- Final sweep: never leave multiple food-truck rows for one owner
+    dedupeOwnerFoodTrucks(ownerId, modelName, plate)
+
+    -- Only call GiveVehicle-style hooks when a NEW row was inserted
+    fireGarageHooks(ownerSrc, ownerId, modelName, plate, props, state, garageName, opts.netId, created)
 
     if not okAny then
+        if not allowCreate then
+            -- Soft-fail on update-only: vehicle may not be purchased/registered yet
+            return false, 'missing_garage_row'
+        end
         print('[viking_foodtruck] WARNING: Garage.RegisterVehicle could not write to any garage DB/table')
         print('[viking_foodtruck] Ensure oxmysql is running and player_vehicles or owned_vehicles exists')
     end
     return okAny
+end
+
+--- Remove every food-truck garage vehicle for an owner (used on sell / repurchase cleanup)
+function Garage.RemoveOwnerFoodTrucks(ownerId, modelName)
+    if not ownerId then return end
+    local rows = listOwnerPlayerVehicles(ownerId)
+    for i = 1, #rows do
+        local row = rows[i]
+        if isFoodTruckRow(row, modelName) or (modelName and row.vehicle and tostring(row.vehicle):lower() == tostring(modelName):lower() and type(row.mods) == 'string' and row.mods:find('foodtruck')) then
+            pcall(function()
+                if row.id then
+                    MySQL.query.await('DELETE FROM player_vehicles WHERE id = ?', { row.id })
+                else
+                    MySQL.query.await('DELETE FROM player_vehicles WHERE plate = ?', { row.plate })
+                end
+            end)
+        end
+    end
+    if tableExists('owned_vehicles') and hasColumn('owned_vehicles', 'owner') then
+        local ok, owned = pcall(function()
+            return MySQL.query.await('SELECT * FROM owned_vehicles WHERE owner = ?', { ownerId })
+        end)
+        if ok and owned then
+            for i = 1, #owned do
+                if isFoodTruckRow(owned[i], modelName) then
+                    pcall(function()
+                        MySQL.query.await('DELETE FROM owned_vehicles WHERE plate = ?', { owned[i].plate })
+                    end)
+                end
+            end
+        end
+    end
 end
 
 function Garage.SetOut(plate, netId)

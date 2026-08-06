@@ -296,15 +296,19 @@ if IsDuplicityVersion() then
             SetVehicleNumberPlateText(vehicle, plate)
         end
 
-        -- Register in garage DB so public garages accept parking this plate
-        if Garage and Garage.RegisterVehicle then
+        -- Mark existing purchase garage row OUT (do not create a second vehicle)
+        if Garage then
             local modelName = (truck.data and truck.data.vehicle) or Config.DefaultVehicle or 'taco'
             local regSrc = Keys.GetSourceByIdentifier(truck.owner_id) or src
-            Garage.RegisterVehicle(regSrc, ownerId, modelName, plate, {
-                model = joaat(modelName),
-                plate = plate,
-            }, { state = 0, netId = netId })
-            Garage.SetOut(plate, netId)
+            if Garage.RegisterVehicle then
+                Garage.RegisterVehicle(regSrc, ownerId, modelName, plate, {
+                    model = joaat(modelName),
+                    plate = plate,
+                }, { state = 0, netId = netId, allowCreate = false })
+            end
+            if Garage.SetOut then
+                Garage.SetOut(plate, netId)
+            end
         end
 
         local ownerSrc = Keys.GetSourceByIdentifier(truck.owner_id)

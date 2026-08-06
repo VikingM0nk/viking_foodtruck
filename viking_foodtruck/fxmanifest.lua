@@ -5,7 +5,7 @@ lua54 'yes'
 name 'viking_foodtruck'
 author 'VikingM0nk'
 description 'Standalone in-game food truck business creator'
-version '1.0.9'
+version '1.1.0'
 
 ui_page 'html/index.html'
 
